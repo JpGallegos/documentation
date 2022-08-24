@@ -1,0 +1,208 @@
+# NVIDIA GPU Builds
+
+:::info Supported Platforms At this moment only platforms running Docker in VMs with PCI Passthrough
+are supported. For a list of supported these please check
+[NVIDIA Docker platform support](https://github.com/NVIDIA/nvidia-docker/wiki/#platform-support) :::
+
+## Set up the build system
+
+### Set up GPU
+
+#### Install NVIDIA drivers
+
+```bash
+sudo ubuntu-drivers devices
+```
+
+This should give you a list of compatible NVIDIA drivers. If the recommended driver is fine, e.g.
+`driver : nvidia-driver-515 - distro non-free recommended` then you can run
+
+```bash
+sudo ubuntu-drivers autoinstall
+sudo reboot
+```
+
+Otherwise,
+
+```bash
+sudo apt install nvidia-driver-<desired version>
+sudo reboot
+```
+
+### Set up Docker
+
+#### Install Docker
+
+```bash
+# Install Docker
+curl https://get.docker.com | sh && sudo systemctl --now enable docker
+```
+
+:::caution Setting up Docker to run in rootless mode has caused issues with the gitlab-runner trying
+to access the GPU when running in system mode. :::
+
+```bash
+# Test install
+sudo docker run --rm -it hello-world
+```
+
+#### Install NVIDIA Container Toolkit
+
+```bash
+# ref: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html#docker
+distribution=$(. /etc/os-release;echo $ID$VERSION_ID) \
+      && curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
+      && curl -s -L https://nvidia.github.io/libnvidia-container/$distribution/libnvidia-container.list | \
+            sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
+            sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+sudo apt update
+sudo apt install -y nvidia-docker2
+```
+
+Now we should test that the PCI passthrough is working.
+
+```bash
+sudo docker run -it --rm  \
+  --net=host \
+  --gpus all \
+  --privileged \
+  -e DISPLAY \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,graphics \
+  -v "/tmp/.X11-unix/X0:/tmp/.X11-unix/X0:ro" \
+  sylladie/gpu-test:latest \
+  /bin/bash -c "glxinfo | grep version"
+```
+
+The expected output is
+
+```bash
+server glx version string: 1.4
+client glx version string: 1.4
+GLX version: 1.4
+OpenGL core profile version string: 4.6.0 NVIDIA 515.65.01
+OpenGL core profile shading language version string: 4.60 NVIDIA
+OpenGL version string: 4.6.0 NVIDIA 515.65.01
+OpenGL shading language version string: 4.60 NVIDIA
+OpenGL ES profile version string: OpenGL ES 3.2 NVIDIA 515.65.01
+OpenGL ES profile shading language version string: OpenGL ES GLSL ES 3.20
+    GL_EXT_shader_group_vote, GL_EXT_shader_implicit_conversions,
+```
+
+### Register and run Gitlab-runner in system mode
+
+:::caution Since the Docker executor will need to run with elevated permissions it is recommended
+that a new runner be registered specifically for these workloads :::
+
+```bash
+sudo gitlab-runner register \
+  --url <URL> \
+  --token <REDACTED> \
+  --name <name>.nvidia-docker \
+  --tag-list gpu
+  --executor docker
+```
+
+#### Configure the Docker executor to allow GPU access.
+
+:::note Some values have been ommited for brevity :::
+
+```toml
+[[runners]]
+  environment = [
+    # Optionally, `NVIDIA_DRIVER_CAPABILITIES` could be set up in the job variables themselves
+    "NVIDIA_DRIVER_CAPABILITIES=graphics,utility,compute",
+    "DISPLAY=:0"
+  ]
+  [runners.docker]
+  # GPU Setup
+    gpus = "all"
+    network_mode = "host"
+    privileged = true
+    volumes = [
+      "/cache",
+      "/tmp/.X11-unix/X0:/tmp/.X11-unix/X0:ro",
+      "/etc/localtime:/etc/localtime:ro"
+    ]
+  # end
+```
+
+## Set up the project
+
+### Update `ci/build.sh`
+
+Change the build script to
+
+```bash
+#!/usr/bin/env bash
+
+set -e
+set -x
+
+echo "Building for $BUILD_TARGET"
+
+export BUILD_PATH=$UNITY_DIR/Builds/$BUILD_TARGET/
+mkdir -p $BUILD_PATH
+
+NO_GRAPHICS=(-nographics)
+
+if [[ "${*}" == *"-enable-gpu"* ]]
+then
+    if [ -z "${NVIDIA_VISIBLE_DEVICES}" ]
+    then
+        echo "No GPU device detected, exiting"
+        exit
+    else
+        NO_GRAPHICS=()
+        echo "NVIDIA GPU support detected"
+        nvidia-smi
+        # See https://github.com/game-ci/unity-test-runner/pull/113#issuecomment-824818548
+        # as to why unity-editor can't run using X virtual framebuffer
+        sed -i "s/xvfb-run -ae \/dev\/stdout //g" /usr/bin/unity-editor
+        UNITY_EXECUTABLE="unity-editor"
+    fi
+fi
+
+${UNITY_EXECUTABLE:-xvfb-run --auto-servernum --server-args='-screen 0 640x480x24' unity-editor} \
+  -projectPath $UNITY_DIR \
+  -quit \
+  -batchmode \
+  "${NO_GRAPHICS[@]}" \
+  -buildTarget $BUILD_TARGET \
+  -customBuildTarget $BUILD_TARGET \
+  -customBuildName $BUILD_NAME \
+  -customBuildPath $BUILD_PATH \
+  -executeMethod BuildCommand.PerformBuild \
+  -logFile /dev/stdout
+
+UNITY_EXIT_CODE=$?
+
+if [ $UNITY_EXIT_CODE -eq 0 ]; then
+  echo "Run succeeded, no failures occurred";
+elif [ $UNITY_EXIT_CODE -eq 2 ]; then
+  echo "Run succeeded, some tests failed";
+elif [ $UNITY_EXIT_CODE -eq 3 ]; then
+  echo "Run failure (other failure)";
+else
+  echo "Unexpected exit code $UNITY_EXIT_CODE";
+fi
+
+ls -la $BUILD_PATH
+[ -n "$(ls -A $BUILD_PATH)" ] # fail job if build folder is empty
+```
+
+### Update `.gitlab-ci.yml` to add runner tags
+
+Add the `gpu` tag to build jobs
+
+```yaml
+.build: &build
+  stage: build_and_test
+  <<: *unity_defaults
+  script:
+    - chmod +x ./ci/build.sh && ./ci/build.sh -enable-gpu
+  artifacts:
+    paths:
+      - $UNITY_DIR/Builds/
+  tags:
+    - gpu
+```
