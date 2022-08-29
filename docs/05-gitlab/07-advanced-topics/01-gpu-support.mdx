@@ -1,21 +1,26 @@
 # NVIDIA GPU Builds
 
-:::info Supported Platforms At this moment only platforms running Docker in VMs with PCI Passthrough
-are supported. For a list of supported these please check
+:::info Supported Platforms Not all platforms are supported, for a list of supported these please
+check
 [NVIDIA Docker platform support](https://github.com/NVIDIA/nvidia-docker/wiki/#platform-support) :::
 
-## Set up the build system
+Getting a
+[`unityci/editor`](https://hub.docker.com/r/unityci/editor/tags?page=1&ordering=last_updated)
+container to use the host machine's NVIDIA GPU requires two things:
 
-### Set up GPU
+1. Container access to host GPU
+2. X server supporting hardware acceleration
 
-#### Install NVIDIA drivers
+## Set up container access to GPU
+
+### Install NVIDIA drivers
 
 ```bash
 sudo ubuntu-drivers devices
 ```
 
 This should give you a list of compatible NVIDIA drivers. If the recommended driver is fine, e.g.
-`driver : nvidia-driver-515 - distro non-free recommended` then you can run
+`driver : nvidia-driver-515 - distro non-free recommended`, then you can run
 
 ```bash
 sudo ubuntu-drivers autoinstall
@@ -31,8 +36,6 @@ sudo reboot
 
 ### Set up Docker
 
-#### Install Docker
-
 ```bash
 # Install Docker
 curl https://get.docker.com | sh && sudo systemctl --now enable docker
@@ -46,7 +49,7 @@ to access the GPU when running in system mode. :::
 sudo docker run --rm -it hello-world
 ```
 
-#### Install NVIDIA Container Toolkit
+### Install NVIDIA Docker container wrapper
 
 ```bash
 # ref: https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html#docker
@@ -59,7 +62,7 @@ sudo apt update
 sudo apt install -y nvidia-docker2
 ```
 
-Now we should test that the PCI passthrough is working.
+Now we should test that the has access to the host machine's GPU.
 
 ```bash
 sudo docker run -it --rm  \
@@ -88,6 +91,13 @@ OpenGL ES profile shading language version string: OpenGL ES GLSL ES 3.20
     GL_EXT_shader_group_vote, GL_EXT_shader_implicit_conversions,
 ```
 
+## Set up X server forwarding
+
+Getting `unityci/editor` containers to use the host's GPU is not enough.
+
+LLVMpipe is a Gallium3D graphics driver in Mesa that does all rendering on the CPU for providing a
+software-accelerated fallback on Linux and can also be used in OpenGL / graphics driver debugging.
+
 ### Register and run Gitlab-runner in system mode
 
 :::caution Since the Docker executor will need to run with elevated permissions it is recommended
@@ -102,7 +112,7 @@ sudo gitlab-runner register \
   --executor docker
 ```
 
-#### Configure the Docker executor to allow GPU access.
+#### Configure the Docker executor to allow GPU access, and X server forwarding
 
 :::note Some values have been ommited for brevity :::
 
@@ -116,8 +126,9 @@ sudo gitlab-runner register \
   [runners.docker]
   # GPU Setup
     gpus = "all"
-    network_mode = "host"
     privileged = true
+  # X server forwarding
+    network_mode = "host"
     volumes = [
       "/cache",
       "/tmp/.X11-unix/X0:/tmp/.X11-unix/X0:ro",
@@ -126,7 +137,7 @@ sudo gitlab-runner register \
   # end
 ```
 
-## Set up the project
+## Set up access to hardware-accelerated X server in the project
 
 ### Update `ci/build.sh`
 
@@ -145,21 +156,20 @@ mkdir -p $BUILD_PATH
 
 NO_GRAPHICS=(-nographics)
 
-if [[ "${*}" == *"-enable-gpu"* ]]
+if [[ "${*}" == *"--enable-rendering"* ]]
 then
-    if [ -z "${NVIDIA_VISIBLE_DEVICES}" ]
-    then
-        echo "No GPU device detected, exiting"
-        exit
-    else
-        NO_GRAPHICS=()
-        echo "NVIDIA GPU support detected"
-        nvidia-smi
-        # See https://github.com/game-ci/unity-test-runner/pull/113#issuecomment-824818548
-        # as to why unity-editor can't run using X virtual framebuffer
-        sed -i "s/xvfb-run -ae \/dev\/stdout //g" /usr/bin/unity-editor
-        UNITY_EXECUTABLE="unity-editor"
-    fi
+  NO_GRAPHICS=()
+  if [ -z "${NVIDIA_VISIBLE_DEVICES}" ]
+  then
+      echo "No GPU device detected, using llvmpipe renderer"
+  else
+    echo "NVIDIA GPU device detected"
+    nvidia-smi
+    # See https://github.com/game-ci/unity-test-runner/pull/113#issuecomment-824818548
+    # as to why unity-editor can't run using X virtual framebuffer
+    sed -i "s/xvfb-run -ae \/dev\/stdout //g" /usr/bin/unity-editor
+    UNITY_EXECUTABLE="unity-editor"
+  fi
 fi
 
 ${UNITY_EXECUTABLE:-xvfb-run --auto-servernum --server-args='-screen 0 640x480x24' unity-editor} \
@@ -199,7 +209,7 @@ Add the `gpu` tag to build jobs
   stage: build_and_test
   <<: *unity_defaults
   script:
-    - chmod +x ./ci/build.sh && ./ci/build.sh -enable-gpu
+    - chmod +x ./ci/build.sh && ./ci/build.sh --enable-rendering
   artifacts:
     paths:
       - $UNITY_DIR/Builds/
